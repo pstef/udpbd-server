@@ -1,3 +1,6 @@
+#include <iostream>
+#include <exception>
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -8,233 +11,286 @@
 
 #include "udpbd.h"
 
+#define BUFLEN  2048
 
-#define BUFLEN  2048    //Max length of buffer
+
+using namespace std;
 
 
-void die(const char *s)
+/*
+ * class CBlockDevice
+ */
+class CBlockDevice
 {
-    perror(s);
-    exit(1);
-}
+public:
+    CBlockDevice(const char *sFileName) : _read_only(false) {
+        // Open the selected file.
+        // This file will be used as the Block Device
+        _fp = open(sFileName, _read_only ? O_RDONLY : O_RDWR);
+        if (_fp < 0) {
+            _read_only = true;
+
+            _fp = open(sFileName, _read_only ? O_RDONLY : O_RDWR);
+            if (_fp < 0)
+                throw runtime_error(string("unable to open file ") + sFileName);
+        }
+
+        // Get the size of the file
+        _fsize = lseek64(_fp, 0, SEEK_END);
+        lseek64(_fp, 0, SEEK_SET);
+
+        printf("Opened '%s' as Block Device\n", sFileName);
+        printf(" - %s\n", _read_only ? "read-only" : "read/write");
+        printf(" - size = %ldMB / %ldMiB\n", _fsize / (1000*1000), _fsize / (1024*1024));
+    }
+
+    ~CBlockDevice() {
+        close(_fp);
+    }
+
+    void seek(uint32_t sector) {
+        loff_t offset = (loff_t)sector * 512;
+        //printf("seek %d * 512 = %ld\n", sector, offset);
+        lseek64(_fp, offset, SEEK_SET);
+    }
+
+    void read(void *data, size_t size) {
+        ssize_t rv = ::read(_fp, data, size);
+        if (rv != size)
+            printf("read error %ld != %ld\n", rv, size);
+    }
+
+    void write(const void *data, size_t size) {
+        ssize_t rv = ::write(_fp, data, size);
+        //printf("write %ld\n", size);
+        if (rv != size)
+            printf("write error %ld != %ld\n", rv, size);
+    }
+
+    uint32_t get_sector_size()  {return 512;}
+    uint32_t get_sector_count() {return _fsize/512;}
+
+private:
+    int _fp;
+    bool _read_only;
+    loff_t _fsize;
+};
+
+/*
+ * class CUDPBDServer
+ */
+class CUDPBDServer
+{
+public:
+    CUDPBDServer(class CBlockDevice &bd) : _bd(bd), _block_shift(0) {
+        set_block_shift(5); // 128b blocks
+        struct sockaddr_in si_me;
+
+        //create a UDP socket
+        if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+            throw runtime_error("socket");
+        }
+
+        //bind socket to port
+        memset((char *) &si_me, 0, sizeof(si_me));
+        si_me.sin_family = AF_INET;
+        si_me.sin_port = htons(UDPBD_PORT);
+        si_me.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(s, (struct sockaddr*)&si_me, sizeof(si_me) ) == -1) {
+            throw runtime_error("bind");
+        }
+
+        // Enable broadcasts
+        int broadcastEnable=1;
+        setsockopt(s, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+    }
+
+    ~CUDPBDServer() {
+        close(s);
+    }
+
+    void run() {
+        struct sockaddr_in si_other;
+        socklen_t slen = sizeof(si_other);
+        int recv_len;
+        char buf[BUFLEN];
+
+        printf("Server running on port %d (0x%x)\n", UDPBD_PORT, UDPBD_PORT);
+
+        // Start server loop
+        while (1) {
+            // Receive command from ps2
+            if ((recv_len = recvfrom(s, buf, BUFLEN, 0, (struct sockaddr *) &si_other, &slen)) == -1) {
+                throw runtime_error("recvfrom");
+            }
+
+            struct SUDPBDv2_Header *hdr = (struct SUDPBDv2_Header *)buf;
+
+            // Process command
+            switch (hdr->cmd) {
+                case UDPBD_CMD_INFO:
+                    handle_cmd_info(si_other, (struct SUDPBDv2_InfoRequest *)buf);
+                    break;
+                case UDPBD_CMD_READ:
+                    handle_cmd_read(si_other, (struct SUDPBDv2_RWRequest *)buf);
+                    break;
+                case UDPBD_CMD_WRITE:
+                    handle_cmd_write(si_other, (struct SUDPBDv2_RWRequest *)buf);
+                    break;
+                case UDPBD_CMD_WRITE_RDMA:
+                    handle_cmd_write_rdma(si_other, (struct SUDPBDv2_RDMA *)buf);
+                    break;
+                default:
+                    printf("Invalid cmd: 0x%x\n", hdr->cmd);
+            };
+        }
+    }
+
+private:
+    void set_block_shift(uint32_t shift) {
+        if (shift != _block_shift) {
+            _block_shift       = shift;
+            _block_size        = 1 << (_block_shift + 2);
+            _blocks_per_packet = RDMA_MAX_PAYLOAD / _block_size;
+            _blocks_per_sector = _bd.get_sector_size() / _block_size;
+            printf("Block size changed to %d\n", _block_size);
+        }
+    }
+
+    void set_block_shift_sectors(uint32_t sectors) {
+        // Optimize for:
+        // 1 - the least number of network packets
+        // 2 - the largest block size (faster on the ps2)
+        uint32_t shift;
+        uint32_t size = sectors * 512;
+        uint32_t packetsMIN  = (size + 1440 - 1) / 1440;
+        uint32_t packets128 = (size + 1408 - 1) / 1408;
+        uint32_t packets256 = (size + 1280 - 1) / 1280;
+        uint32_t packets512 = (size + 1024 - 1) / 1024;
+
+        if (packets512 == packetsMIN)
+            shift = 7; // 512 byte blocks
+        else if (packets256 == packetsMIN)
+            shift = 6; // 256 byte blocks
+        else if (packets128 == packetsMIN)
+            shift = 5; // 128 byte blocks
+        else
+            shift = 3; //  32 byte blocks
+
+        set_block_shift(shift);
+    }
+
+    void handle_cmd_info(struct sockaddr_in &si_other, struct SUDPBDv2_InfoRequest *request) {
+        struct SUDPBDv2_InfoReply reply;
+
+        char str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &si_other.sin_addr, str, INET_ADDRSTRLEN);
+
+        printf("UDPBD_CMD_INFO from %s\n", str);
+
+        // Reply header
+        reply.hdr.cmd      = UDPBD_CMD_INFO_REPLY;
+        reply.hdr.cmdid    = request->hdr.cmdid;
+        reply.hdr.cmdpkt   = 1;
+        // Reply info
+        reply.sector_size  = _bd.get_sector_size();
+        reply.sector_count = _bd.get_sector_count();
+
+        // Send packet to ps2
+        if (sendto(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
+            throw runtime_error("sendto");
+        }
+    }
+
+    void handle_cmd_read(struct sockaddr_in &si_other, struct SUDPBDv2_RWRequest *request) {
+        struct SUDPBDv2_RDMA reply;
+
+        printf("UDPBD_CMD_READ(cmdId=%d, startSector=%d, sectorCount=%d)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
+
+        // Optimize RDMA block size for number of sectors
+        set_block_shift_sectors(request->sector_count);
+
+        // Reply header
+        reply.hdr.cmd        = UDPBD_CMD_READ_RDMA;
+        reply.hdr.cmdid      = request->hdr.cmdid;
+        reply.hdr.cmdpkt     = 1;
+        reply.bt.block_shift = _block_shift;
+
+        uint32_t blocks_left = request->sector_count * _blocks_per_sector;
+
+        _bd.seek(request->sector_nr);
+
+        // Packet loop
+        while (blocks_left > 0) {
+            reply.bt.block_count = (blocks_left > _blocks_per_packet) ? _blocks_per_packet : blocks_left;
+            blocks_left -= reply.bt.block_count;
+
+            // read data from file
+            _bd.read(reply.data, reply.bt.block_count * _block_size);
+
+            // Send packet to ps2
+            if (sendto(s, &reply, sizeof(struct SUDPBDv2_Header) + 4 + (reply.bt.block_count * _block_size), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
+                throw runtime_error("sendto");
+            }
+            reply.hdr.cmdpkt++;
+        }
+    }
+
+    void handle_cmd_write(struct sockaddr_in &si_other, struct SUDPBDv2_RWRequest *request) {
+        printf("UDPBD_CMD_WRITE(cmdId=%d, startSector=%d, sectorCount=%d)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
+
+        _bd.seek(request->sector_nr);
+        _write_size_left = request->sector_count * 512;
+    }
+
+    void handle_cmd_write_rdma(struct sockaddr_in &si_other, struct SUDPBDv2_RDMA *request) {
+        size_t size = request->bt.block_count * (1 << (request->bt.block_shift + 2));
+        //printf("UDPBD_CMD_WRITE_RDMA(cmdId=%d, BS=%d, BC=%d, size=%ld)\n", request->hdr.cmdid, request->bt.block_shift, request->bt.block_count, size);
+
+        _bd.write(request->data, size);   
+        _write_size_left -= size;
+        if(_write_size_left == 0) {
+            struct SUDPBDv2_WriteDone reply;
+
+            // Reply header
+            reply.hdr.cmd      = UDPBD_CMD_WRITE_DONE;
+            reply.hdr.cmdid    = request->hdr.cmdid;
+            reply.hdr.cmdpkt   = request->hdr.cmdid + 1;
+            reply.result       = 0; 
+
+            // Send packet to ps2
+            if (sendto(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
+                throw runtime_error("sendto");
+            }
+        }
+    }
+
+    class CBlockDevice &_bd;
+    uint32_t _block_shift;
+    uint32_t _block_size;
+    uint32_t _blocks_per_packet;
+    uint32_t _blocks_per_sector;
+    int s;
+
+    uint32_t _write_size_left;
+};
 
 int main(int argc, char * argv[])
 {
-    struct sockaddr_in si_me, si_other;
-    socklen_t slen = sizeof(si_other);
-    int fp, s, recv_len;
-    char buf[BUFLEN];
-    struct SUDPBD_Header * hdr = (struct SUDPBD_Header *)buf;
-    bool read_only = false;
-    bool read_only_write_error = false;
-    off_t fsize;
-
     if (argc < 2) {
         printf("Usage:\n");
         printf("  %s <file>\n", argv[0]);
-        return 1;
+        return -1;
     }
 
-    const char * sFile = argv[1];
-
-    // Open the selected file.
-    // This file will be used as the Block Device
-    fp = open(sFile, read_only ? O_RDONLY : O_RDWR);
-    if (fp < 0) {
-        read_only = true;
-
-        fp = open(sFile, read_only ? O_RDONLY : O_RDWR);
-        if (fp < 0)
-            die(sFile);
+    try {
+        class CBlockDevice bd(argv[1]);
+        class CUDPBDServer srv(bd);
+        srv.run();
+    } catch (exception& e) {
+        cout<<e.what()<<'\n';
+        return -2;
     }
-    // Get the size of the file
-    fsize = lseek(fp, 0, SEEK_END);
-    lseek(fp, 0, SEEK_SET);
-
-    printf("Opened '%s' as Block Device\n", sFile);
-    printf(" - %s\n", read_only ? "read-only" : "read/write");
-    printf(" - size = %ldMB / %ldMiB\n", fsize / (1000*1000), fsize / (1024*1024));
-
-    //create a UDP socket
-    if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
-        close(fp);
-        die("socket");
-    }
-
-    //bind socket to port
-    memset((char *) &si_me, 0, sizeof(si_me));
-    si_me.sin_family = AF_INET;
-    si_me.sin_port = htons(UDPBD_PORT);
-    si_me.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(s, (struct sockaddr*)&si_me, sizeof(si_me) ) == -1) {
-        close(fp);
-        die("bind");
-    }
-
-    // Enable broadcasts
-    int broadcastEnable=1;
-    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
-
-    // Send INFO broadcast
-    hdr->bd_magic  = UDPBD_HEADER_MAGIC;
-    hdr->bd_cmd    = UDPBD_CMD_INFO;
-    hdr->bd_cmdid  = 0;
-    hdr->bd_cmdpkt = 1;
-    hdr->bd_count  = 0;
-    hdr->bd_par1   = 512;       // Sector size
-    hdr->bd_par2   = fsize/512; // Sector count
-    si_other.sin_family = AF_INET;
-    si_other.sin_port = htons(UDPBD_PORT);
-    si_other.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    if (sendto(s, buf, sizeof(struct SUDPBD_Header), 0, (struct sockaddr*) &si_other, slen) == -1) {
-        close(fp);
-        die("sendto");
-    }
-
-    printf("Server running on port %d (0x%x)\n", UDPBD_PORT, UDPBD_PORT);
-
-    // Start server loop
-    while (1) {
-        // Receive command from ps2
-        if ((recv_len = recvfrom(s, buf, BUFLEN, 0, (struct sockaddr *) &si_other, &slen)) == -1) {
-            close(fp);
-            die("recvfrom");
-        }
-
-        // Check header magic
-        if (hdr->bd_magic != UDPBD_HEADER_MAGIC) {
-            printf("Invalid header magic: 0x%x\n", hdr->bd_magic);
-            continue;
-        }
-
-        // Check if this packet is a request
-        if ((hdr->bd_cmdpkt != 0) && (hdr->bd_cmd != UDPBD_CMD_WRITE)) {
-            //printf("Invalid cmdpkt: %d\n", hdr->bd_cmdpkt);
-            continue;
-        }
-
-        // Process command
-        switch (hdr->bd_cmd) {
-            case UDPBD_CMD_INFO:
-                {
-                    struct SUDPBD_Packet * pkt = (struct SUDPBD_Packet *)buf;
-                    char str[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &si_other.sin_addr, str, INET_ADDRSTRLEN);
-
-                    printf("UDPBD_CMD_INFO from %s\n", str);
-
-                    //pkt->hdr.bd_magic  = UDPBD_HEADER_MAGIC;
-                    //pkt->hdr.bd_cmd    = UDPBD_CMD_INFO;
-                    //pkt->hdr.bd_cmdid  = pkt->hdr.bd_cmdid;
-                    pkt->hdr.bd_cmdpkt = 1;
-                    pkt->hdr.bd_count  = 0;
-                    pkt->hdr.bd_par1   = 512;       // Sector size
-                    pkt->hdr.bd_par2   = fsize/512; // Sector count
-
-                    // Send packet to ps2
-                    if (sendto(s, buf, sizeof(struct SUDPBD_Header), 0, (struct sockaddr*) &si_other, slen) == -1) {
-                        close(fp);
-                        die("sendto");
-                    }
-                }
-                break;
-            case UDPBD_CMD_READ:
-                {
-                    struct SUDPBD_Packet * pkt = (struct SUDPBD_Packet *)buf;
-                    uint32_t total_size = pkt->hdr.bd_count * 512;
-                    loff_t offset = (loff_t)pkt->hdr.bd_par1 * 512;
-                    uint32_t size_left = total_size;
-
-                    printf("UDPBD_CMD_READ(cmdId=%d, startSector=%d, sectorCount=%d)\n", pkt->hdr.bd_cmdid, pkt->hdr.bd_par1, pkt->hdr.bd_count);
-
-                    // lseek to the requested file position
-                    lseek64(fp, offset, SEEK_SET);
-
-                    // readahead 2x the requested size
-                    readahead(fp, offset, total_size*2);
-
-                    //pkt->hdr.bd_magic  = UDPBD_HEADER_MAGIC;
-                    //pkt->hdr.bd_cmd    = UDPBD_CMD_READ;
-                    //pkt->hdr.bd_cmdid  = pkt->hdr.bd_cmdid;
-                    pkt->hdr.bd_cmdpkt = 1;
-                    pkt->hdr.bd_count  = 0;
-                    pkt->hdr.bd_par1   = 0;
-                    pkt->hdr.bd_par2   = 0; // not used
-
-                    // Packet loop
-                    while (size_left > 0) {
-                        uint32_t tx_size = (size_left > UDPBD_MAX_DATA) ? UDPBD_MAX_DATA : size_left;
-                        size_left -= tx_size;
-
-                        // read data from file
-                        if (read(fp, pkt->data, tx_size) != tx_size)
-                            printf("ERROR: read failed\n");
-                        pkt->hdr.bd_par1 = tx_size;
-
-                        // Send packet to ps2
-                        if (sendto(s, buf, sizeof(struct SUDPBD_Header) + tx_size, 0, (struct sockaddr*) &si_other, slen) == -1) {
-                            close(fp);
-                            die("sendto");
-                        }
-                        pkt->hdr.bd_cmdpkt++;
-                    }
-                }
-                break;
-            case UDPBD_CMD_WRITE:
-                if (read_only == true) {
-                    if (read_only_write_error == false) {
-                        printf("Warning: File is read only! ignoring all write commands\n");
-                        printf(" -> future messages will be suppressed\n");
-                        read_only_write_error = true;
-                    }
-                    break;
-                }
-                else {
-                    struct SUDPBD_Packet * pkt = (struct SUDPBD_Packet *)buf;
-                    uint32_t total_size = pkt->hdr.bd_count * 512;
-                    uint32_t offset = pkt->hdr.bd_par1 * 512;
-                    static uint32_t size_left;
-                    static uint32_t cmdpkt = 0;
-
-                    printf("UDPBD_CMD_WRITE(cmdId=%d, startSector=%d, sectorCount=%d)\n", pkt->hdr.bd_cmdid, pkt->hdr.bd_par1, pkt->hdr.bd_count);
-
-                    offset += pkt->hdr.bd_cmdpkt * UDPBD_MAX_DATA;
-
-                    // Check packet sequence
-                    if (pkt->hdr.bd_cmdpkt != cmdpkt) {
-                        printf("ERROR: invalid cmdpkt: %d\n", pkt->hdr.bd_cmdpkt);
-                        printf(" -> Possible data corruption!\n");
-                        printf(" -> Fallback to read only mode\n");
-                        read_only = true;
-                        break;
-                    }
-
-                    // First packet
-                    if (pkt->hdr.bd_cmdpkt == 0) {
-                        size_left = total_size;
-                        cmdpkt = 0;
-                    }
-
-                    uint32_t write_size = size_left < UDPBD_MAX_DATA ? size_left : UDPBD_MAX_DATA;
-                    printf("-> Writing %d bytes to %d\n", write_size, offset);
-
-                    // lseek to the requested file position
-                    lseek(fp, offset, SEEK_SET);
-
-                    // write data to file
-                    //write(fp, pkt->data, write_size);
-
-                    size_left -= write_size;
-                    cmdpkt = size_left == 0 ? 0 : cmdpkt+1;
-                }
-                break;
-            default:
-                printf("unknown command: 0x%x\n", hdr->bd_cmd);
-        };
-    }
-
-    close(fp);
-    close(s);
 
     return 0;
 }
