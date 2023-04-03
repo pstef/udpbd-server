@@ -13,6 +13,11 @@
 
 #define BUFLEN  2048
 
+#ifdef __APPLE__
+#define _DARWIN_USE_64_BIT_INODE 1
+#define lseek64 lseek
+#define loff_t off_t
+#endif
 
 using namespace std;
 
@@ -247,7 +252,7 @@ private:
         size_t size = request->bt.block_count * (1 << (request->bt.block_shift + 2));
         //printf("UDPBD_CMD_WRITE_RDMA(cmdId=%d, BS=%d, BC=%d, size=%ld)\n", request->hdr.cmdid, request->bt.block_shift, request->bt.block_count, size);
 
-        _bd.write(request->data, size);   
+        _bd.write(request->data, size);
         _write_size_left -= size;
         if(_write_size_left == 0) {
             struct SUDPBDv2_WriteDone reply;
@@ -256,7 +261,7 @@ private:
             reply.hdr.cmd      = UDPBD_CMD_WRITE_DONE;
             reply.hdr.cmdid    = request->hdr.cmdid;
             reply.hdr.cmdpkt   = request->hdr.cmdid + 1;
-            reply.result       = 0; 
+            reply.result       = 0;
 
             // Send packet to ps2
             if (sendto(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
