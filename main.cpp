@@ -98,7 +98,7 @@ private:
 class CUDPBDServer
 {
 public:
-    CUDPBDServer(class CBlockDevice &bd) : _bd(bd), _block_shift(0) {
+    CUDPBDServer(class CBlockDevice &bd) : _bd(bd), _block_shift(0), _total_read(0), _total_write(0) {
         set_block_shift(5); // 128b blocks
         struct sockaddr_in si_me;
 
@@ -163,13 +163,18 @@ public:
     }
 
 private:
+    void print_stats() {
+        printf("Total read: %ld KiB, total write: %ld KiB", _total_read/1024, _total_write/1024);
+        fflush(stdout);
+    }
+
     void set_block_shift(uint32_t shift) {
         if (shift != _block_shift) {
             _block_shift       = shift;
             _block_size        = 1 << (_block_shift + 2);
             _blocks_per_packet = RDMA_MAX_PAYLOAD / _block_size;
             _blocks_per_sector = _bd.get_sector_size() / _block_size;
-            printf("Block size changed to %d\n", _block_size);
+            //printf("Block size changed to %d\n", _block_size);
         }
     }
 
@@ -202,7 +207,8 @@ private:
         char str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &si_other.sin_addr, str, INET_ADDRSTRLEN);
 
-        printf("UDPBD_CMD_INFO from %s\n", str);
+        printf("\rUDPBD_CMD_INFO from %s\n", str);
+        print_stats();
 
         // Reply header
         reply.hdr.cmd      = UDPBD_CMD_INFO_REPLY;
@@ -221,7 +227,7 @@ private:
     void handle_cmd_read(struct sockaddr_in &si_other, struct SUDPBDv2_RWRequest *request) {
         struct SUDPBDv2_RDMA reply;
 
-        printf("UDPBD_CMD_READ(cmdId=%d, startSector=%d, sectorCount=%d)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
+        printf("\rUDPBD_CMD_READ(cmdId=%d, startSector=%d, sectorCount=%d)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
 
         // Optimize RDMA block size for number of sectors
         set_block_shift_sectors(request->sector_count);
@@ -233,6 +239,9 @@ private:
         reply.bt.block_shift = _block_shift;
 
         uint32_t blocks_left = request->sector_count * _blocks_per_sector;
+
+        _total_read += blocks_left * _block_size;
+        print_stats();
 
         _bd.seek(request->sector_nr);
 
@@ -253,10 +262,13 @@ private:
     }
 
     void handle_cmd_write(struct sockaddr_in &si_other, struct SUDPBDv2_RWRequest *request) {
-        printf("UDPBD_CMD_WRITE(cmdId=%d, startSector=%d, sectorCount=%d)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
+        printf("\rUDPBD_CMD_WRITE(cmdId=%d, startSector=%d, sectorCount=%d)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
 
         _bd.seek(request->sector_nr);
         _write_size_left = request->sector_count * 512;
+
+        _total_write += _write_size_left;
+        print_stats();
     }
 
     void handle_cmd_write_rdma(struct sockaddr_in &si_other, struct SUDPBDv2_RDMA *request) {
@@ -287,6 +299,9 @@ private:
     uint32_t _blocks_per_packet;
     uint32_t _blocks_per_sector;
     int s;
+
+    uint64_t _total_read;
+    uint64_t _total_write;
 
     uint32_t _write_size_left;
 };
