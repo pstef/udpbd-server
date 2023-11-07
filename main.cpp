@@ -13,12 +13,15 @@
 
 #define BUFLEN  2048
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined( __FreeBSD__)
 #include <sys/ioctl.h>
 #include <sys/disk.h>
-#define _DARWIN_USE_64_BIT_INODE 1
 #define lseek64 lseek
 #define loff_t off_t
+#endif
+
+#if defined(__APPLE__)
+#define _DARWIN_USE_64_BIT_INODE 1
 #endif
 
 using namespace std;
@@ -45,13 +48,19 @@ public:
         // Get the size of the file
         _fsize = lseek64(_fp, 0, SEEK_END);
         lseek64(_fp, 0, SEEK_SET);
-#ifdef __APPLE__
+#if defined(__APPLE__)
         if (_fsize == 0) {
             uint64_t blockCount;
             uint32_t blockSize;
             ioctl(_fp, DKIOCGETBLOCKCOUNT, &blockCount);
             ioctl(_fp, DKIOCGETBLOCKSIZE, &blockSize);
             _fsize = blockCount * blockSize;
+        }
+#elif defined(__FreeBSD__)
+        if (_fsize == 0) {
+            uint64_t mediaSize;
+            ioctl(_fp, DIOCGMEDIASIZE, &mediaSize);
+            _fsize = mediaSize;
         }
 #endif
 
@@ -112,7 +121,7 @@ public:
         si_me.sin_family = AF_INET;
         si_me.sin_port = htons(UDPBD_PORT);
         si_me.sin_addr.s_addr = htonl(INADDR_ANY);
-        if (bind(s, (struct sockaddr*)&si_me, sizeof(si_me) ) == -1) {
+        if (::bind(s, (struct sockaddr*)&si_me, sizeof(si_me) ) == -1) {
             throw runtime_error("bind");
         }
 
