@@ -13,12 +13,15 @@
 
 #define BUFLEN  2048
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined( __FreeBSD__)
 #include <sys/ioctl.h>
 #include <sys/disk.h>
-#define _DARWIN_USE_64_BIT_INODE 1
 #define lseek64 lseek
 #define loff_t off_t
+#endif
+
+#if defined(__APPLE__)
+#define _DARWIN_USE_64_BIT_INODE 1
 #endif
 
 using namespace std;
