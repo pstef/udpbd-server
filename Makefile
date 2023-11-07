@@ -2,7 +2,7 @@ BIN=udpbd-server
 OBJS=main.o
 
 udpbd-server: $(OBJS)
-	g++ -o $@ $^
+	$(CXX) $(LDFLAGS) -o $@ $(OBJS)
 
 all: $(BIN)
 
