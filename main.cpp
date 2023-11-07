@@ -48,13 +48,19 @@ public:
         // Get the size of the file
         _fsize = lseek64(_fp, 0, SEEK_END);
         lseek64(_fp, 0, SEEK_SET);
-#ifdef __APPLE__
+#if defined(__APPLE__)
         if (_fsize == 0) {
             uint64_t blockCount;
             uint32_t blockSize;
             ioctl(_fp, DKIOCGETBLOCKCOUNT, &blockCount);
             ioctl(_fp, DKIOCGETBLOCKSIZE, &blockSize);
             _fsize = blockCount * blockSize;
+        }
+#elif defined(__FreeBSD__)
+        if (_fsize == 0) {
+            uint64_t mediaSize;
+            ioctl(_fp, DIOCGMEDIASIZE, &mediaSize);
+            _fsize = mediaSize;
         }
 #endif
 
