@@ -1,19 +1,39 @@
 #include <iostream>
 #include <exception>
+#include <stdexcept>
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
 
 #include "udpbd.h"
 
 #define BUFLEN  2048
 
-#if defined(__APPLE__) || defined( __FreeBSD__)
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define loff_t __int64
+#define SENDTO(s, buf, len, flags, addr, addrlen) sendto(s, (const char*)(buf), len, flags, addr, addrlen)
+#define SETSOCKOPT(s, lvl, opt, val, vlen) setsockopt(s, lvl, opt, (char*)(val), vlen)
+#else
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#define SENDTO(s, buf, len, flags, addr, addrlen) sendto(s, buf, len, flags, addr, addrlen)
+#define SETSOCKOPT(s, lvl, opt, val, vlen) setsockopt(s, lvl, opt, val, vlen)
+#endif
+
+#if defined(__MINGW32__)
+#define open _open
+#define read _read
+#define write _write
+#define close _close
+#define lseek64 _lseeki64
+#endif
+
+#if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/ioctl.h>
 #include <sys/disk.h>
 #define lseek64 lseek
@@ -111,6 +131,13 @@ public:
         set_block_shift(5); // 128b blocks
         struct sockaddr_in si_me;
 
+#if defined(_WIN32)
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
+            throw runtime_error("WSAStartup failed");
+        }
+#endif
+
         //create a UDP socket
         if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
             throw runtime_error("socket");
@@ -127,11 +154,16 @@ public:
 
         // Enable broadcasts
         int broadcastEnable=1;
-        setsockopt(s, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+        SETSOCKOPT(s, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
     }
 
     ~CUDPBDServer() {
+#if defined(_WIN32)
+        closesocket(s);
+        WSACleanup();
+#else
         close(s);
+#endif
     }
 
     void run() {
@@ -213,8 +245,12 @@ private:
     void handle_cmd_info(struct sockaddr_in &si_other, struct SUDPBDv2_InfoRequest *request) {
         struct SUDPBDv2_InfoReply reply;
 
+    #if defined(_WIN32)
+        char *str = inet_ntoa(si_other.sin_addr);
+    #else
         char str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &si_other.sin_addr, str, INET_ADDRSTRLEN);
+    #endif
 
         printf("\rUDPBD_CMD_INFO from %s\n", str);
         print_stats();
@@ -228,7 +264,7 @@ private:
         reply.sector_count = _bd.get_sector_count();
 
         // Send packet to ps2
-        if (sendto(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
+        if (SENDTO(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
             throw runtime_error("sendto");
         }
     }
@@ -263,7 +299,7 @@ private:
             _bd.read(reply.data, reply.bt.block_count * _block_size);
 
             // Send packet to ps2
-            if (sendto(s, &reply, sizeof(struct SUDPBDv2_Header) + 4 + (reply.bt.block_count * _block_size), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
+            if (SENDTO(s, &reply, sizeof(struct SUDPBDv2_Header) + 4 + (reply.bt.block_count * _block_size), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
                 throw runtime_error("sendto");
             }
             reply.hdr.cmdpkt++;
@@ -296,7 +332,7 @@ private:
             reply.result       = 0;
 
             // Send packet to ps2
-            if (sendto(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
+            if (SENDTO(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
                 throw runtime_error("sendto");
             }
         }
