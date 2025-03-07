@@ -215,7 +215,7 @@ private:
             _block_size        = 1 << (_block_shift + 2);
             _blocks_per_packet = RDMA_MAX_PAYLOAD / _block_size;
             _blocks_per_sector = _bd.get_sector_size() / _block_size;
-            printf("Block size changed to %d\n", _block_size);
+            //printf("Block size changed to %d\n", _block_size);
         }
     }
 
