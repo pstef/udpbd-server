@@ -1,0 +1,62 @@
+stages:
+  - make
+  - dist
+
+.make:
+  image: dockcross/linux-x64
+  stage: make
+  artifacts:
+    when: on_success
+    expire_in: 1h
+    paths:
+      - build/
+  script:
+    - make build
+
+make.x86_64:
+  extends: .make
+  image: dockcross/linux-x64:20210629-12a662e  # last boockworm image
+  variables:
+    TARGET_ARCH: "x86_64"
+
+make.i686:
+  extends: .make
+  image: dockcross/linux-x86:20210629-12a662e  # last boockworm image
+  variables:
+    TARGET_ARCH: "i686"
+
+make.aarch64:
+  extends: .make
+  image: dockcross/linux-arm64-lts:20250109-7bf589c
+  variables:
+    TARGET_ARCH: "aarch64"
+
+make.armv7:
+  extends: .make
+  image: dockcross/linux-armv7-lts:20250109-7bf589c
+  variables:
+    TARGET_ARCH: "armv7"
+
+make.win64:
+  extends: .make
+  image: dockcross/windows-static-x64:20250109-7bf589c
+  variables:
+    TARGET_ARCH: "win64"
+
+make.win32:
+  extends: .make
+  image: dockcross/windows-static-x86:20250109-7bf589c
+  variables:
+    TARGET_ARCH: "win32"
+
+make.dist:
+  extends: .make
+  stage: dist
+  artifacts:
+    when: on_success
+    name: udpbd-server
+    expire_in: never
+    paths:
+      - udpbd-server/*
+  script:
+    - mv build udpbd-server
