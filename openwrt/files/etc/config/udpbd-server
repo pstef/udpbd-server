@@ -1,0 +1,4 @@
+config udpbd-server server
+	option enabled '1'
+	option verbose '0'
+	option path '/dev/sda'
