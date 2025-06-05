@@ -121,6 +121,17 @@ int BlockDevice_init(BlockDevice *bd, const char *sFileName) {
     }
     printf(" - size = %lldMB / %lldMiB\n", (long long)bd->_fsize / (1000*1000), (long long)bd->_fsize / (1024*1024));
 
+#if defined(__linux__) || defined(__FreeBSD__) // Systems known to support posix_fadvise well
+    if (bd->_fp >= 0) {
+        // Advise for sequential access for the entire file.
+        // offset = 0, len = 0 advises for the whole file.
+        if (posix_fadvise(bd->_fp, 0, 0, POSIX_FADV_SEQUENTIAL) != 0) {
+            // perror("BlockDevice_init: posix_fadvise POSIX_FADV_SEQUENTIAL failed");
+            // Non-fatal error, so just print if desired, or ignore.
+        }
+    }
+#endif
+
     return 0; // Success
 }
 
@@ -141,6 +152,24 @@ void BlockDevice_seek(BlockDevice *bd, uint32_t sector) {
 
 ssize_t BlockDevice_read(BlockDevice *bd, void *data, size_t size) {
     if (!bd || bd->_fp < 0 || !data) return -1; // Basic error check
+
+#if defined(__linux__) || defined(__FreeBSD__)
+    if (bd->_fp >= 0) {
+        // Get current file offset. lseek with SEEK_CUR doesn't change the offset.
+        loff_t current_offset = lseek(bd->_fp, 0, SEEK_CUR);
+        if (current_offset != (loff_t)-1) {
+            // Advise that we will need the data range [current_offset, current_offset + size -1].
+            if (posix_fadvise(bd->_fp, current_offset, size, POSIX_FADV_WILLNEED) != 0) {
+                // perror("BlockDevice_read: posix_fadvise POSIX_FADV_WILLNEED failed");
+                // Non-fatal, ignore return value.
+            }
+        } else {
+            // perror("BlockDevice_read: lseek for current_offset failed before posix_fadvise");
+            // Failed to get current offset, so cannot advise accurately.
+        }
+    }
+#endif
+
     ssize_t rv = read(bd->_fp, data, size);
     if (rv != (ssize_t)size) { // ssize_t vs size_t comparison
         // Original: printf("read error %ld != %ld\n", rv, size);
