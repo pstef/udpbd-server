@@ -2,11 +2,25 @@
 #include <string.h> // For memset, memcpy
 #include <stdlib.h> // For exit, atoi (if used)
 #include <stdbool.h>
+#include <time.h>
+#include <signal.h>
 
 #include "udpbd_c.h" // Contains UDPBDServer struct and prototypes, BlockDevice too
 
 // BUFLEN needs to be defined, it was in main.cpp
 #define BUFLEN 2048
+
+// Struct and array for block size statistics
+struct BlockSizeStat {
+    uint32_t block_size;
+    uint64_t count;
+};
+struct BlockSizeStat block_size_stats_data[32];
+int num_block_size_stats = 0;
+
+// Global variables for statistics
+uint64_t total_bytes_transferred = 0;
+double total_request_handling_time = 0.0;
 
 // Platform-specific socket code was in main.cpp, needs to be here or in udpbd_c.h
 // udpbd_c.h already includes winsock2.h or sys/socket.h etc.
@@ -26,9 +40,10 @@
 #endif
 
 // Forward declarations for static helper functions
-static void UDPBDServer_print_stats(UDPBDServer *srv);
 static void UDPBDServer_set_block_shift(UDPBDServer *srv, uint32_t shift);
+static void handle_sigusr1(int sig);
 static void UDPBDServer_set_block_shift_sectors(UDPBDServer *srv, uint32_t sectors);
+static void update_block_size_stats(uint32_t block_size, uint32_t num_blocks);
 
 // Error reporting helper
 static int report_error(const char* context, const char* message) {
@@ -109,6 +124,7 @@ int UDPBDServer_init(UDPBDServer *srv, const char *sFileName) {
         return report_error("setsockopt SO_BROADCAST", "Failed");
     }
 
+    signal(SIGUSR1, handle_sigusr1); // Register signal handler
     return 0; // Success
 }
 
@@ -142,6 +158,7 @@ int UDPBDServer_run(UDPBDServer *srv) {
     printf("Server running on port %d (0x%x)\n", UDPBD_PORT, UDPBD_PORT);
 
     while (1) {
+        struct timespec start_time, end_time;
         // Receive command
         recv_len = recvfrom(srv->s, buf, BUFLEN, 0, (struct sockaddr *) &si_other, &slen);
 #if defined(_WIN32)
@@ -159,6 +176,7 @@ int UDPBDServer_run(UDPBDServer *srv) {
             fprintf(stderr, "Received packet too small (%d bytes)\n", recv_len);
             continue; // Ignore malformed/short packet
         }
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
 
         struct SUDPBDv2_Header *hdr = (struct SUDPBDv2_Header *)buf;
         int cmd_result = 0;
@@ -188,6 +206,9 @@ int UDPBDServer_run(UDPBDServer *srv) {
             // For now, log and continue serving other requests.
             fprintf(stderr, "Error processing command 0x%x\n", hdr->cmd);
         }
+        clock_gettime(CLOCK_MONOTONIC, &end_time);
+        double elapsed_time = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+        total_request_handling_time += elapsed_time;
     }
     return 0; // Should not be reached in normal operation of this server
 }
@@ -195,12 +216,43 @@ int UDPBDServer_run(UDPBDServer *srv) {
 
 // --- Static Helper Functions ---
 
-static void UDPBDServer_print_stats(UDPBDServer *srv) {
-    // Original used long for KiB, ensure types are large enough (uint64_t for _total_read/write)
-    printf("Total read: %llu KiB, total write: %llu KiB\n",
-           (unsigned long long)srv->_total_read / 1024,
-           (unsigned long long)srv->_total_write / 1024);
-    fflush(stdout); // Ensure it's printed, especially if line ends with \r
+static void update_block_size_stats(uint32_t block_size, uint32_t num_blocks) {
+    for (int i = 0; i < num_block_size_stats; ++i) {
+        if (block_size_stats_data[i].block_size == block_size) {
+            block_size_stats_data[i].count += num_blocks;
+            return;
+        }
+    }
+
+    if (num_block_size_stats < 32) {
+        block_size_stats_data[num_block_size_stats].block_size = block_size;
+        block_size_stats_data[num_block_size_stats].count = num_blocks;
+        num_block_size_stats++;
+    } else {
+        fprintf(stderr, "Warning: Maximum number of unique block sizes reached. Cannot track new block size: %u\n", block_size);
+    }
+}
+
+static void handle_sigusr1(int sig) {
+    (void)sig; // Unused parameter
+
+    double transfer_speed = 0.0;
+    if (total_request_handling_time > 0.000001) {
+        transfer_speed = (double)total_bytes_transferred / total_request_handling_time;
+    }
+
+    printf("Total bytes transferred: %llu B\n", (unsigned long long)total_bytes_transferred);
+    printf("Total request handling time: %f s\n", total_request_handling_time);
+    printf("Average transfer speed: %f B/s\n", transfer_speed);
+
+    printf("Block size frequencies:\n");
+    for (int i = 0; i < num_block_size_stats; ++i) {
+        printf("  - Size: %u B, Count: %llu\n",
+               block_size_stats_data[i].block_size,
+               (unsigned long long)block_size_stats_data[i].count);
+    }
+    printf("--- End of Statistics ---\n");
+    fflush(stdout);
 }
 
 static void UDPBDServer_set_block_shift(UDPBDServer *srv, uint32_t shift) {
@@ -219,7 +271,6 @@ static void UDPBDServer_set_block_shift(UDPBDServer *srv, uint32_t shift) {
         } else {
             srv->_blocks_per_sector = BlockDevice_get_sector_size(&srv->_bd) / srv->_block_size;
         }
-        //printf("Block size changed to %d\n", srv->_block_size); // Original comment
     }
 }
 
@@ -303,9 +354,6 @@ int UDPBDServer_handle_cmd_info(UDPBDServer *srv, struct sockaddr_in *si_other, 
     }
 #endif
 
-    printf("UDPBD_CMD_INFO from %s (cmdId=%d)\n", client_ip_str, request->hdr.cmdid);
-    UDPBDServer_print_stats(srv);
-
     reply.hdr.cmd      = UDPBD_CMD_INFO_REPLY;
     reply.hdr.cmdid    = request->hdr.cmdid;
     reply.hdr.cmdpkt   = 1;
@@ -320,9 +368,6 @@ int UDPBDServer_handle_cmd_info(UDPBDServer *srv, struct sockaddr_in *si_other, 
 
 int UDPBDServer_handle_cmd_read(UDPBDServer *srv, struct sockaddr_in *si_other, socklen_t slen, struct SUDPBDv2_RWRequest *request) {
     struct SUDPBDv2_RDMA reply;
-
-    printf("UDPBD_CMD_READ(cmdId=%d, startSector=%u, sectorCount=%u)\n",
-           request->hdr.cmdid, request->sector_nr, request->sector_count);
 
     if (request->sector_count == 0) {
         printf("Read request for 0 sectors, doing nothing.\n");
@@ -349,7 +394,8 @@ int UDPBDServer_handle_cmd_read(UDPBDServer *srv, struct sockaddr_in *si_other, 
     uint32_t blocks_left = total_sectors_to_read * blocks_per_device_sector;
 
     srv->_total_read += (uint64_t)blocks_left * srv->_block_size;
-    UDPBDServer_print_stats(srv);
+    total_bytes_transferred += (uint64_t)blocks_left * srv->_block_size;
+    update_block_size_stats(srv->_block_size, blocks_left);
 
     BlockDevice_seek(&srv->_bd, request->sector_nr);
 
@@ -384,9 +430,6 @@ int UDPBDServer_handle_cmd_write(UDPBDServer *srv, struct sockaddr_in *si_other,
     (void)si_other;
     (void)slen;
 
-    printf("UDPBD_CMD_WRITE(cmdId=%d, startSector=%u, sectorCount=%u)\n",
-           request->hdr.cmdid, request->sector_nr, request->sector_count);
-
     if (BlockDevice_is_readonly(&srv->_bd)) {
         fprintf(stderr, "Error: Write command received but block device is read-only.\n");
         // Consider sending NACK based on protocol design if client expects one for WRITE setup.
@@ -420,7 +463,6 @@ int UDPBDServer_handle_cmd_write(UDPBDServer *srv, struct sockaddr_in *si_other,
     srv->_write_size_left = request->sector_count * device_sector_size;
 
     srv->_total_write += srv->_write_size_left;
-    UDPBDServer_print_stats(srv);
     return 0;
 }
 
@@ -428,8 +470,7 @@ int UDPBDServer_handle_cmd_write_rdma(UDPBDServer *srv, struct sockaddr_in *si_o
     uint32_t current_block_size = 1 << (request->bt.block_shift + 2);
     size_t data_size = (size_t)request->bt.block_count * current_block_size;
 
-    // printf("UDPBD_CMD_WRITE_RDMA(cmdId=%d, pkt=%d, BS=%d, BC=%d, size=%zu)\n",
-    //       request->hdr.cmdid, request->hdr.cmdpkt, request->bt.block_shift, request->bt.block_count, data_size);
+    update_block_size_stats(current_block_size, request->bt.block_count);
 
     if (BlockDevice_is_readonly(&srv->_bd)) {
         fprintf(stderr, "Error: Write RDMA command received but block device is read-only.\n");
@@ -491,6 +532,7 @@ int UDPBDServer_handle_cmd_write_rdma(UDPBDServer *srv, struct sockaddr_in *si_o
         SENDTO_IMPL(srv->s, &reply, sizeof(reply), 0, (struct sockaddr*) si_other, slen);
         return -1;
     }
+    total_bytes_transferred += bytes_written;
 
     if (srv->_write_size_left >= data_size) {
         srv->_write_size_left -= data_size;
